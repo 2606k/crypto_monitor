@@ -1,0 +1,58 @@
+# .github/workflows/crypto-monitor.yml
+name: Crypto Monitor
+
+on:
+  schedule:
+    # 每5分钟运行一次 (GitHub Actions 最小间隔是5分钟)
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # 允许手动触发
+  push:
+    branches: [ main ]
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Run crypto monitor
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: python crypto_monitor_actions.py
+      
+    - name: Upload data artifacts
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: crypto-data-${{ github.run_number }}
+        path: data/
+        retention-days: 7
+        
+    - name: Upload logs
+      uses: actions/upload-artifact@v3  
+      if: always()
+      with:
+        name: logs-${{ github.run_number }}
+        path: "*.log"
+        retention-days: 3
