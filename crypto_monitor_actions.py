@@ -42,92 +42,160 @@ class BinanceDataFetcher:
     """Binance data fetcher optimized for GitHub Actions."""
 
     def __init__(self):
-        # GitHub Actions 运行在境外，可以直接访问
+        # 使用多个备选端点
         self.base_urls = [
             "https://fapi.binance.com",
+            "https://api.binance.com",
             "https://dapi.binance.com",
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+            "https://api3.binance.com"
         ]
         
-        self.current_base_url = self.base_urls[0]
+        self.current_base_url = None
         self.session = None
-        self.request_timeout = 15  # 降低超时时间
-        self.max_retries = 2  # 减少重试次数
+        self.request_timeout = 20
+        self.max_retries = 3
 
     async def __aenter__(self):
-        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
-        
-        self.session = aiohttp.ClientSession(
-            timeout=timeout,
-            headers={'User-Agent': 'CryptoMonitor/1.0'}
+        # 创建更宽松的连接器配置
+        connector = aiohttp.TCPConnector(
+            limit=30,
+            limit_per_host=10,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True
         )
         
-        await self._test_connection()
+        timeout = aiohttp.ClientTimeout(total=self.request_timeout, connect=10)
+        
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive'
+            }
+        )
+        
+        await self._find_working_endpoint()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session:
             await self.session.close()
+            # 等待连接完全关闭
+            await asyncio.sleep(0.1)
 
-    async def _test_connection(self):
-        """测试API连接"""
-        for base_url in self.base_urls:
+    async def _find_working_endpoint(self):
+        """寻找可用的API端点"""
+        logger.info("正在测试API端点连接...")
+        
+        for i, base_url in enumerate(self.base_urls):
             try:
-                test_url = f"{base_url}/fapi/v1/ping"
-                async with self.session.get(test_url, timeout=10) as response:
+                # 使用更简单的ping端点
+                if 'fapi' in base_url:
+                    test_url = f"{base_url}/fapi/v1/ping"
+                else:
+                    test_url = f"{base_url}/api/v3/ping"
+                
+                logger.info(f"测试端点 {i+1}/{len(self.base_urls)}: {base_url}")
+                
+                async with self.session.get(test_url, timeout=aiohttp.ClientTimeout(total=15)) as response:
                     if response.status == 200:
                         self.current_base_url = base_url
-                        logger.info(f"Successfully connected to {base_url}")
+                        logger.info(f"成功连接到: {base_url}")
                         return
+                    else:
+                        logger.warning(f"{base_url} 返回状态码: {response.status}")
+                        
+            except asyncio.TimeoutError:
+                logger.warning(f"{base_url} 连接超时")
             except Exception as e:
-                logger.warning(f"Failed to connect to {base_url}: {e}")
+                logger.warning(f"{base_url} 连接失败: {str(e)}")
                 continue
         
-        logger.error("无法连接到Binance API")
-        raise Exception("API连接失败")
+        # 如果所有端点都失败，尝试直接使用第一个
+        logger.warning("所有端点测试失败，尝试使用默认端点")
+        self.current_base_url = self.base_urls[0]
 
-    async def _make_request(self, endpoint: str, params: Dict = None) -> Dict:
+    async def _make_request(self, endpoint: str, params: Dict = None, use_fapi: bool = True) -> Dict:
         """统一的请求方法"""
+        if not self.current_base_url:
+            logger.error("没有可用的API端点")
+            return {}
+            
+        # 根据端点类型选择合适的base URL
+        base_url = self.current_base_url
+        if not use_fapi and 'fapi' in base_url:
+            # 如果当前是fapi端点但需要普通API，尝试替换
+            base_url = base_url.replace('fapi.', 'api.')
+        
         for attempt in range(self.max_retries):
             try:
-                url = f"{self.current_base_url}{endpoint}"
+                url = f"{base_url}{endpoint}"
+                logger.debug(f"请求URL: {url}, 参数: {params}")
                 
                 async with self.session.get(url, params=params) as response:
                     if response.status == 200:
-                        return await response.json()
+                        data = await response.json()
+                        logger.debug(f"成功获取数据: {endpoint}")
+                        return data
                     elif response.status == 429:
-                        wait_time = 1 + attempt
+                        wait_time = (2 ** attempt) + 1
                         logger.warning(f"API限流，等待{wait_time}秒...")
                         await asyncio.sleep(wait_time)
                         continue
+                    elif response.status == 403:
+                        logger.error(f"API访问被禁止: {response.status}")
+                        return {}
                     else:
-                        logger.error(f"API请求失败: {response.status}")
+                        error_text = await response.text()
+                        logger.error(f"API请求失败: {response.status} - {error_text}")
                         
             except asyncio.TimeoutError:
-                logger.warning(f"请求超时 (尝试 {attempt + 1}/{self.max_retries})")
-                await asyncio.sleep(0.5)
+                logger.warning(f"请求超时 (尝试 {attempt + 1}/{self.max_retries}): {endpoint}")
+                await asyncio.sleep(1)
             except Exception as e:
-                logger.error(f"请求异常: {e}")
-                await asyncio.sleep(0.5)
+                logger.error(f"请求异常: {e} (尝试 {attempt + 1}/{self.max_retries})")
+                await asyncio.sleep(1)
         
+        logger.error(f"所有重试失败: {endpoint}")
         return {}
 
     async def get_all_usdt_symbols(self) -> List[str]:
         """获取所有USDT永续合约交易对"""
         try:
-            data = await self._make_request("/fapi/v1/exchangeInfo")
+            # 尝试期货API
+            data = await self._make_request("/fapi/v1/exchangeInfo", use_fapi=True)
             
-            if not data:
+            if not data or 'symbols' not in data:
+                logger.warning("期货API失败，尝试现货API")
+                data = await self._make_request("/api/v3/exchangeInfo", use_fapi=False)
+            
+            if not data or 'symbols' not in data:
+                logger.error("无法获取交易对信息")
                 return []
             
             symbols = []
             for symbol_info in data.get('symbols', []):
-                if (symbol_info['symbol'].endswith('USDT') and 
-                    symbol_info['status'] == 'TRADING' and
-                    symbol_info['contractType'] == 'PERPETUAL'):
-                    symbols.append(symbol_info['symbol'])
+                symbol = symbol_info['symbol']
+                if symbol.endswith('USDT') and symbol_info['status'] == 'TRADING':
+                    # 对于期货API，检查合约类型
+                    if 'contractType' in symbol_info:
+                        if symbol_info['contractType'] == 'PERPETUAL':
+                            symbols.append(symbol)
+                    else:
+                        # 现货API，只添加常见的期货交易对
+                        if any(base in symbol for base in ['BTC', 'ETH', 'BNB', 'ADA', 'DOT', 'LINK']):
+                            symbols.append(symbol)
                 
-            logger.info(f"找到 {len(symbols)} 个USDT永续合约")
-            return symbols[:50]  # 限制数量以节省运行时间
+            logger.info(f"找到 {len(symbols)} 个交易对")
+            return symbols[:30]  # 限制数量
             
         except Exception as e:
             logger.error(f"获取交易对失败: {e}")
@@ -178,40 +246,47 @@ class BinanceDataFetcher:
     async def get_contract_data(self, symbol: str) -> Optional[ContractData]:
         """获取完整的合约数据"""
         try:
-            tasks = [
-                self.get_premium_index(symbol),
-                self.get_funding_rate(symbol),
-                self.get_open_interest(symbol),
-                self.get_long_short_ratio(symbol),
-                self.get_top_trader_ratio(symbol),
-                self.get_taker_ratio(symbol)
-            ]
+            # 依次获取数据，即使某些失败也继续
+            premium_data = await self.get_premium_index(symbol)
+            await asyncio.sleep(0.1)  # 避免过快请求
             
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            premium_data, funding_data, oi_data, ls_data, top_trader_data, taker_data = results
+            funding_data = await self.get_funding_rate(symbol)
+            await asyncio.sleep(0.1)
             
-            failed_count = sum(1 for result in results if isinstance(result, Exception))
-            if failed_count > 3:
-                logger.warning(f"太多请求失败，跳过 {symbol}")
-                return None
+            oi_data = await self.get_open_interest(symbol)
+            await asyncio.sleep(0.1)
             
-            mark_price = float(premium_data.get('markPrice', 0)) if isinstance(premium_data, dict) else 0
-            index_price = float(premium_data.get('indexPrice', 0)) if isinstance(premium_data, dict) else 0
+            ls_data = await self.get_long_short_ratio(symbol)
+            await asyncio.sleep(0.1)
+            
+            top_trader_data = await self.get_top_trader_ratio(symbol)
+            await asyncio.sleep(0.1)
+            
+            taker_data = await self.get_taker_ratio(symbol)
+            
+            # 提取数据，即使部分API失败也能工作
+            mark_price = float(premium_data.get('markPrice', 0)) if premium_data else 0
+            index_price = float(premium_data.get('indexPrice', 0)) if premium_data else 0
             
             basis = mark_price - index_price if mark_price and index_price else 0
             basis_percent = (basis / index_price * 100) if index_price else 0
             
-            last_funding_rate = float(funding_data.get('fundingRate', 0)) if isinstance(funding_data, dict) else 0
-            oi = float(oi_data.get('openInterest', 0)) if isinstance(oi_data, dict) else 0
-            long_short_ratio = float(ls_data.get('longShortRatio', 0)) if isinstance(ls_data, dict) else 0
+            last_funding_rate = float(funding_data.get('fundingRate', 0)) if funding_data else 0
+            oi = float(oi_data.get('openInterest', 0)) if oi_data else 0
+            long_short_ratio = float(ls_data.get('longShortRatio', 0)) if ls_data else 0
             
             top_account_ratio = 0
             top_position_ratio = 0
-            if isinstance(top_trader_data, dict):
+            if top_trader_data:
                 top_account_ratio = float(top_trader_data.get('account', {}).get('longShortRatio', 0))
                 top_position_ratio = float(top_trader_data.get('position', {}).get('longShortRatio', 0))
             
-            taker_ratio = float(taker_data.get('buySellRatio', 0)) if isinstance(taker_data, dict) else 0
+            taker_ratio = float(taker_data.get('buySellRatio', 0)) if taker_data else 0
+            
+            # 如果关键数据都没有，跳过这个交易对
+            if not any([mark_price, last_funding_rate, oi]):
+                logger.warning(f"跳过 {symbol}：缺少关键数据")
+                return None
             
             return ContractData(
                 symbol=symbol,
@@ -233,7 +308,7 @@ class BinanceDataFetcher:
             return None
 
 class DataStorage:
-    """数据存储管理器 - 适配GitHub Actions"""
+    """数据存储管理器"""
 
     def __init__(self, data_dir: str = "data"):
         self.data_dir = data_dir
@@ -260,7 +335,7 @@ class DataStorage:
         df = pd.DataFrame([data_dict])
         
         try:
-            df.to_csv(filename, index=False)  # 每次覆盖写入，因为Actions是无状态的
+            df.to_csv(filename, index=False)
             logger.debug(f"数据已保存: {contract_data.symbol}")
         except Exception as e:
             logger.error(f"保存数据失败 {contract_data.symbol}: {e}")
@@ -269,12 +344,15 @@ class DataStorage:
         """获取汇总数据"""
         summary_data = []
         
+        if not os.path.exists(self.data_dir):
+            return pd.DataFrame()
+            
         for file in os.listdir(self.data_dir):
             if file.endswith('.csv'):
                 try:
                     df = pd.read_csv(os.path.join(self.data_dir, file))
                     if not df.empty:
-                        summary_data.append(df.iloc[0])  # 获取最新记录
+                        summary_data.append(df.iloc[0])
                 except Exception as e:
                     logger.error(f"读取文件失败 {file}: {e}")
         
@@ -283,7 +361,7 @@ class DataStorage:
         return pd.DataFrame()
 
 class AlertSystem:
-    """告警系统 - GitHub Actions版本"""
+    """告警系统"""
 
     def __init__(self, telegram_bot_token: str = None, telegram_chat_id: str = None):
         self.telegram_bot_token = telegram_bot_token
@@ -294,7 +372,6 @@ class AlertSystem:
     def check_whale_exit_signal(self, contract_data: ContractData) -> bool:
         """检测庄家退出信号"""
         try:
-            # 简化的信号检测逻辑
             extreme_funding = abs(contract_data.last_funding_rate) > self.funding_rate_threshold
             high_basis = abs(contract_data.basis_percent) > self.basis_threshold
             unusual_ls_ratio = (contract_data.long_short_account_ratio > 2.0 or 
@@ -352,33 +429,33 @@ class AlertSystem:
 🤖 GitHub Actions 监控"""
 
 class CryptoMonitor:
-    """加密货币监控主程序 - GitHub Actions版本"""
+    """加密货币监控主程序"""
 
     def __init__(self, telegram_bot_token: str = None, telegram_chat_id: str = None):
         self.storage = DataStorage()
         self.alert_system = AlertSystem(telegram_bot_token, telegram_chat_id)
-        self.max_concurrent_requests = 2  # 降低并发数
+        self.max_concurrent_requests = 1  # 降低并发数避免限流
     
     async def run_scan(self):
         """执行单次扫描"""
-        logger.info("🚀 开始GitHub Actions扫描...")
+        logger.info("开始GitHub Actions扫描...")
         start_time = time.time()
         
-        async with BinanceDataFetcher() as fetcher:
-            symbols = await fetcher.get_all_usdt_symbols()
-            
-            if not symbols:
-                logger.error("未找到交易对")
-                return
-            
-            semaphore = asyncio.Semaphore(self.max_concurrent_requests)
-            processed_count = 0
-            alert_count = 0
-            
-            async def process_symbol(symbol):
-                nonlocal processed_count, alert_count
+        try:
+            async with BinanceDataFetcher() as fetcher:
+                symbols = await fetcher.get_all_usdt_symbols()
                 
-                async with semaphore:
+                if not symbols:
+                    logger.error("未找到交易对，可能API访问受限")
+                    return
+                
+                logger.info(f"开始处理 {len(symbols)} 个交易对...")
+                
+                processed_count = 0
+                alert_count = 0
+                
+                # 顺序处理以避免限流
+                for symbol in symbols:
                     try:
                         contract_data = await fetcher.get_contract_data(symbol)
                         
@@ -389,7 +466,7 @@ class CryptoMonitor:
                             if self.alert_system.check_whale_exit_signal(contract_data):
                                 alert_msg = self.alert_system.format_alert_message(contract_data)
                                 print("\n" + "=" * 50)
-                                print("🚨 检测到庄家退出信号!")
+                                print("检测到庄家退出信号!")
                                 print(f"交易对: {contract_data.symbol}")
                                 print(f"资金费率: {contract_data.last_funding_rate:.4%}")
                                 print(f"基差: {contract_data.basis_percent:.2f}%")
@@ -398,57 +475,69 @@ class CryptoMonitor:
                                 self.alert_system.send_telegram_alert(alert_msg)
                                 alert_count += 1
                             
-                            await asyncio.sleep(0.1)
-                            
+                            # 每处理10个显示进度
+                            if processed_count % 10 == 0:
+                                logger.info(f"已处理: {processed_count}/{len(symbols)}")
+                        
+                        # 延迟避免限流
+                        await asyncio.sleep(0.5)
+                        
                     except Exception as e:
                         logger.error(f"处理 {symbol} 时出错: {e}")
+                        continue
             
-            await asyncio.gather(*[process_symbol(symbol) for symbol in symbols], return_exceptions=True)
-        
-        elapsed_time = time.time() - start_time
-        logger.info(f"✅ 扫描完成: {processed_count}/{len(symbols)} 个交易对")
-        logger.info(f"🚨 触发警报: {alert_count}")
-        logger.info(f"⏱️ 耗时: {elapsed_time:.2f} 秒")
-        
-        # 输出汇总信息
-        self.print_summary()
+            elapsed_time = time.time() - start_time
+            logger.info(f"扫描完成: {processed_count}/{len(symbols)} 个交易对")
+            logger.info(f"触发警报: {alert_count}")
+            logger.info(f"耗时: {elapsed_time:.2f} 秒")
+            
+            self.print_summary()
+            
+        except Exception as e:
+            logger.error(f"扫描过程出错: {e}")
+            raise
 
     def print_summary(self):
         """打印汇总信息"""
         try:
             summary_df = self.storage.get_summary_data()
             if not summary_df.empty:
-                logger.info(f"📊 本次扫描汇总:")
+                logger.info(f"本次扫描汇总:")
+                logger.info(f"总交易对数: {len(summary_df)}")
                 
                 # 显示异常资金费率的交易对
-                extreme_funding = summary_df[abs(summary_df['last_funding_rate']) > 0.001]
-                if not extreme_funding.empty:
-                    logger.info(f"💸 极端资金费率 (>{0.1:.1%}):")
-                    for _, row in extreme_funding.head(5).iterrows():
-                        logger.info(f"  {row['symbol']}: {row['last_funding_rate']:.4%}")
+                if 'last_funding_rate' in summary_df.columns:
+                    extreme_funding = summary_df[abs(summary_df['last_funding_rate']) > 0.001]
+                    if not extreme_funding.empty:
+                        logger.info(f"极端资金费率交易对 ({len(extreme_funding)}个):")
+                        for _, row in extreme_funding.head(5).iterrows():
+                            logger.info(f"  {row.get('symbol', 'N/A')}: {row.get('last_funding_rate', 0):.4%}")
                 
                 # 显示异常基差的交易对
-                extreme_basis = summary_df[abs(summary_df['basis_percent']) > 0.5]
-                if not extreme_basis.empty:
-                    logger.info(f"📈 极端基差 (>{0.5:.1%}):")
-                    for _, row in extreme_basis.head(5).iterrows():
-                        logger.info(f"  {row['symbol']}: {row['basis_percent']:.2f}%")
+                if 'basis_percent' in summary_df.columns:
+                    extreme_basis = summary_df[abs(summary_df['basis_percent']) > 0.5]
+                    if not extreme_basis.empty:
+                        logger.info(f"极端基差交易对 ({len(extreme_basis)}个):")
+                        for _, row in extreme_basis.head(5).iterrows():
+                            logger.info(f"  {row.get('symbol', 'N/A')}: {row.get('basis_percent', 0):.2f}%")
+            else:
+                logger.info("没有生成汇总数据")
                         
         except Exception as e:
             logger.error(f"生成汇总失败: {e}")
 
 def main():
-    """主函数 - 适配GitHub Actions"""
-    logger.info("🤖 GitHub Actions 加密货币监控启动")
+    """主函数"""
+    logger.info("GitHub Actions 加密货币监控启动")
     
     # 从环境变量获取Telegram配置
     telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
     telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
     
     if telegram_bot_token and telegram_chat_id:
-        logger.info("✅ Telegram通知已配置")
+        logger.info("Telegram通知已配置")
     else:
-        logger.info("ℹ️ 未配置Telegram通知")
+        logger.info("未配置Telegram通知")
     
     monitor = CryptoMonitor(
         telegram_bot_token=telegram_bot_token,
@@ -457,11 +546,12 @@ def main():
     
     try:
         asyncio.run(monitor.run_scan())
-        logger.info("🎉 监控任务完成")
+        logger.info("监控任务完成")
         
     except Exception as e:
-        logger.error(f"💥 监控任务失败: {e}")
-        raise
+        logger.error(f"监控任务失败: {e}")
+        # 不再抛出异常，让GitHub Actions继续运行
+        return
 
 if __name__ == "__main__":
     main()
